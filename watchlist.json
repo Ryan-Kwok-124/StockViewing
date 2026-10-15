@@ -1,0 +1,11 @@
+{
+ "AAPL": "AAPL",
+ "LULU": "LULU",
+ "TSLA": "TSLA",
+ "Tencent (700)": "0700.HK",
+ "TSMC (2330)": "2330.TW",
+ "HSI": "^HSI",
+ "S&P 500": "^GSPC",
+ "Nasdaq 100": "^NDX",
+ "VIX": "^VIX"
+}
