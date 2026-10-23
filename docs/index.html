@@ -1,4 +1,124 @@
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+"""Trading dashboard: TradingView analysis + news + ideas + Futu (牛牛) trading, in ONE program.
+
+pip install requests vaderSentiment futu-api
+  python trading_dashboard.py --open             analyze, build docs/index.html and open it (no trading)
+  python trading_dashboard.py --trade --open     the same, plus the Futu connection (PAPER trading by default)
+  python trading_dashboard.py --trade --skip-analysis --open    restart trading quickly, reusing the last page
+
+Your TradingView watchlist can't be read automatically (no public API). Export it once:
+TradingView > watchlist menu (...) > "Export list..." and save it as watchlist.txt next to this script.
+
+Trading needs Futu OpenD installed, logged in and running (default port 11111).
+REAL money needs BOTH  --real  and the FUTU_TRADE_PWD environment variable. Moomoo users: --firm FUTUINC.
+"""
+import sys, re, json, os, time, pathlib, secrets, argparse, threading, datetime as dt, webbrowser
+import urllib.parse as up
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import requests
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+PAGE = pathlib.Path("docs/index.html")
+A = None                                  # parsed command-line options (set in main)
+ft = None                                 # the futu module (imported only when --trade is used)
+quote, tctx = None, {}                    # Futu connections
+TOKEN, ENV, ENV_NAME = "", None, "SIMULATE"
+LOCK = threading.Lock()
+LOT, SUBBED = {}, set()
+TV_HOSTS = ("https://scanner.tradingview.com/", "https://news-headlines.tradingview.com/")
+
+DEFAULT = ["NASDAQ:AAPL", "NASDAQ:LULU", "NASDAQ:TSLA", "HKEX:700", "TWSE:2330",
+           "TVC:HSI", "SP:SPX", "NASDAQ:NDX", "CBOE:VIX"]
+COLS = ["name", "description", "close", "change", "Recommend.All", "RSI", "MACD.macd", "MACD.signal", "Perf.1M"]
+MK = {"HKEX": "hongkong", "TWSE": "taiwan", "TPEX": "taiwan", "TSE": "japan", "LSE": "uk", "SSE": "china",
+      "SZSE": "china", "NASDAQ": "america", "NYSE": "america", "AMEX": "america", "NYSEARCA": "america",
+      "SP": "america", "DJ": "america", "CBOE": "america"}
+S = requests.Session()
+S.headers["User-Agent"] = "Mozilla/5.0"
+sia = SentimentIntensityAnalyzer()
+
+
+def load(path):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return DEFAULT
+    toks = re.split(r"[,\n]", p.read_text(encoding="utf-8", errors="ignore"))
+    return [t.strip() for t in toks if ":" in t and not t.strip().startswith("#")]
+
+
+def scan(tickers):
+    """TradingView scanner: price + technical indicators for symbols like NASDAQ:AAPL."""
+    out, by = {}, {}
+    for t in tickers:
+        by.setdefault(MK.get(t.split(":")[0], "global"), []).append(t)
+    todo = list(by.items())
+    for m, ts in todo + [("global", None)]:
+        if ts is None:
+            ts = [t for t in tickers if t not in out]
+            if not ts:
+                break
+        r = S.post(f"https://scanner.tradingview.com/{m}/scan",
+                   json={"symbols": {"tickers": ts}, "columns": COLS}, timeout=20)
+        for d in r.json().get("data", []):
+            out[d["s"]] = dict(zip(COLS, d["d"]))
+    return out
+
+
+def news(t):
+    try:
+        j = S.get("https://news-headlines.tradingview.com/v2/headlines",
+                  params={"client": "web", "lang": "en", "symbol": t}, timeout=15).json()
+        items = j.get("items", j) if isinstance(j, dict) else j
+        return [i["title"] for i in items[:8] if i.get("title")]
+    except Exception:
+        return []
+
+
+clip = lambda x, a=-1, b=1: max(a, min(b, x))
+
+
+def score(d, sn):
+    rec, rsi, c = d["Recommend.All"] or 0, d["RSI"] or 50, d["close"] or 1
+    macd = clip(((d["MACD.macd"] or 0) - (d["MACD.signal"] or 0)) / c * 200)
+    mom = clip((d["Perf.1M"] or 0) / 10)
+    rev = -(rsi - 70) / 15 if rsi > 70 else (30 - rsi) / 15 if rsi < 30 else 0
+    tech = 0.5 * rec + 0.2 * macd + 0.2 * mom + 0.1 * clip(rev)
+    return tech, 0.7 * (tech + 1) / 2 + 0.3 * (sn + 1) / 2
+
+
+rating = lambda s: ("STRONG BUY" if s >= .6 else "BUY" if s >= .54 else
+                    "STRONG SELL" if s <= .4 else "SELL" if s <= .46 else "HOLD")
+
+
+def row(t, d, hl):
+    hs = [{"t": h, "s": round(sia.polarity_scores(h)["compound"], 2)} for h in hl]
+    sn = sum(h["s"] for h in hs) / len(hs) if hs else 0.0
+    tech, sc = score(d, sn)
+    return dict(name=d["name"], desc=d["description"], symbol=t, price=d["close"], chg=round(d["change"] or 0, 2),
+                rec=d["Recommend.All"] or 0, rsi=round(d["RSI"] or 50, 1), tech=round(tech, 3),
+                sentiment=round(sn, 3), score=round(sc, 3), signal=rating(sc), headlines=hs[:4])
+
+
+def discover(have, n=6):
+    """Screen large liquid stocks on TradingView, rank by technicals, then check news on the finalists."""
+    cands = []
+    for m, cap in (("america", 1e10), ("hongkong", 2e10)):
+        body = {"filter": [{"left": "market_cap_basic", "operation": "greater", "right": cap},
+                           {"left": "type", "operation": "equal", "right": "stock"}],
+                "options": {"lang": "en"}, "markets": [m], "symbols": {"query": {"types": []}, "tickers": []},
+                "columns": COLS, "sort": {"sortBy": "Recommend.All", "sortOrder": "desc"}, "range": [0, 25]}
+        try:
+            for d in S.post(f"https://scanner.tradingview.com/{m}/scan", json=body, timeout=20).json()["data"]:
+                if d["s"] not in have:
+                    x = dict(zip(COLS, d["d"]))
+                    cands.append((score(x, 0)[0], d["s"], x))
+        except Exception as e:
+            print("discover failed for", m, e)
+    cands.sort(key=lambda c: -c[0])
+    ideas = [row(s, x, news(s)) for _, s, x in cands[:12]]
+    return sorted(ideas, key=lambda r: -r["score"])[:n]
+
+
+TEMPLATE = r"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Watchlist Outlook</title>
 <style>
 :root{--bg:#fff;--card:#f5f6f8;--tx:#16181d;--mu:#6b7280;--sb:#067a4c;--b:#2fb67c;--h:#8a8f98;--s:#e8707f;--ss:#c4122f}
@@ -22,6 +142,10 @@ input{min-width:270px}button{cursor:pointer;font-weight:600}button:disabled{opac
 .fu{animation:fu .6s}.fd{animation:fd .6s}@keyframes fu{from{background:#0a8f5b66}}@keyframes fd{from{background:#d6334a66}}
 #modal{position:fixed;inset:0;background:#000b;z-index:9;display:flex;align-items:center;justify-content:center}#modal[hidden]{display:none}
 .mb{width:min(1150px,96vw);height:88vh;background:var(--bg);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}#mc{flex:1}
+.tbtn{display:none;gap:8px;margin:6px 0}body.br .tbtn{display:flex}.tbtn button{flex:1;padding:5px}
+table{border-collapse:collapse;margin:8px 0;font-size:13px}td,th{padding:4px 12px 4px 0;text-align:left}th{color:var(--mu);font-weight:600}
+#om{position:fixed;inset:0;background:#000b;z-index:10;display:flex;align-items:center;justify-content:center}#om[hidden]{display:none}
+.ob{width:min(430px,94vw);background:var(--bg);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:10px}.ob input{min-width:0;width:100%}
 </style>
 <div id="tv"></div>
 <h1>Watchlist Outlook</h1>
@@ -32,27 +156,37 @@ input{min-width:270px}button{cursor:pointer;font-weight:600}button:disabled{opac
  <select id="iv"><option value="0">Off</option><option value="1000">Every 1 second</option><option value="30000">Every 30 seconds</option>
  <option value="60000">Every 1 minute</option><option value="300000">Every 5 minutes</option></select></label>
  <button id="re">Re-analyze all (with news)</button><span class="mu" id="st"></span></div>
+<div class="row"><b>Futu 牛牛</b><input id="tk" placeholder="Bridge token (or open the link futu_bridge.py prints)" style="min-width:300px">
+ <button id="cn">Connect</button><span class="mu" id="bs">Not connected. Run futu_bridge.py to trade.</span></div>
+<div id="acct" class="mu"></div>
+<div class="row" id="autobar" hidden><label><input type="checkbox" id="auto"> Ask me to confirm a trade when a stock stays STRONG BUY (or STRONG SELL if I hold it)</label>
+ <label>Budget per buy <input id="bud" type="number" value="10000" style="min-width:0;width:110px"></label></div>
 <div class="sum" id="sum"></div><div class="grid" id="grid"></div>
 <h2 id="ih" hidden>Ideas to research</h2>
 <div class="mu" id="ihn" hidden>Large, liquid stocks that TradingView's technicals and the latest news currently favor. Starting points for your own research, not recommendations.</div>
 <div class="grid" id="ideas" style="margin-top:12px"></div>
 <div class="mu" style="margin-top:20px">Not financial advice. Rating = 70% TradingView technical indicators (aggregate rating, MACD, 1-month momentum, RSI extremes) + 30% news-headline sentiment. It is a rules-based outlook, not a trained forecast. Charts and the top ticker are TradingView widgets.</div>
+<div id="om" hidden><div class="ob"><b id="ot"></b><div class="mu" id="oi"></div>
+ <label>Quantity<input id="oq" type="number" min="1"></label><label>Limit price<input id="op" type="number" step="any"></label>
+ <div id="oe" style="color:var(--ss);font-weight:600"></div>
+ <div class="row" style="margin:0"><button id="oy">Yes, place order</button><button id="on">No</button></div></div></div>
 <div id="modal" hidden><div class="mb"><button id="mx">Close ✕</button><div id="mc"></div></div></div>
 <script>
-const INIT=[{"name": "VIX", "desc": "CBOE Volatility Index", "symbol": "CBOE:VIX", "price": 16.87, "chg": 10.48, "rec": 0.4577922077922078, "rsi": 57.6, "tech": 0.32, "sentiment": 0.023, "score": 0.615, "signal": "STRONG BUY", "headlines": [{"t": "CHI FED'S GOOLSBEE Q&A/YAHOO ENDED", "s": 0.0}, {"t": "CHI FED'S GOOLSBEE Q&A/YAHOO: IN SHORT RUN BIGGEST CONCERN IS WHETHER ECONOMY OVERRUNNING ITS CAPACITY; 'LOT OF THINGS GOING ON' WITH RATES", "s": 0.0}, {"t": "CHI FED'S GOOLSBEE Q&A/YAHOO: MORE A.I. 'HYPE,' THE GREATER THE RISK OF OVERHEATING; A.I. 'UNCOMFORTABLY SHOVING DOWN OTHER SECTORS'", "s": -0.32}, {"t": "CHI FED'S GOOLSBEE Q&A/YAHOO: NEED TO GET MORE INFLATION DATA; SHORT RUN INFLATION EXPECTATIONS 'GETTING A LITTLE WONKIER;' CONSUMERS 'QUITE STRONG'", "s": 0.56}]}, {"name": "AAPL", "desc": "Apple Inc.", "symbol": "NASDAQ:AAPL", "price": 342.96, "chg": 0.5, "rec": 0.4212121212121212, "rsi": 62.1, "tech": 0.276, "sentiment": 0.008, "score": 0.598, "signal": "BUY", "headlines": [{"t": "The AI trade is splintering as inflation fears rattle hyped-up tech stocks", "s": -0.42}, {"t": "Apple Reportedly Set To Launch AI Features In China Following Regulatory Approvals", "s": 0.0}, {"t": "Apple Stock Soars to New Highs, Despite Tech Slump — WSJ", "s": 0.0}, {"t": "Apple Hits $5 Trillion Milestone as Rest of Tech Trade Falters. Can It Hold? — Barrons.com", "s": 0.0}]}, {"name": "SPX", "desc": "S&P 500", "symbol": "SP:SPX", "price": 7718.94, "chg": -1.11, "rec": 0.06666666666666667, "rsi": 49.5, "tech": 0.074, "sentiment": -0.171, "score": 0.5, "signal": "HOLD", "headlines": [{"t": "Dow, S&P 500, Nasdaq Decline Amid Hot Inflation Data, AI Selloff: CRWV, NBIS, NVDA, IBRX Stocks In Focus", "s": 0.0}, {"t": "FED GOV BOWMAN/BANGKOK REPEATS PREVIOUS SPEECH ON BANK SUPERVISION REFORMS; CONSIDERTING WAYS TO 'ENHANCE' SUPERVISORY DECISIONMAKING", "s": 0.0}, {"t": "Stock Selloff Deepens in Asia Amid AI, Fed Rate-Hike Concerns", "s": 0.0}, {"t": "S&P 500 ends longest streak of calm since 2020 as AI trade sinks", "s": 0.32}]}, {"name": "LULU", "desc": "lululemon athletica inc.", "symbol": "NASDAQ:LULU", "price": 94.09, "chg": -0.26, "rec": -0.3090909090909091, "rsi": 37.6, "tech": -0.064, "sentiment": 0.101, "score": 0.493, "signal": "HOLD", "headlines": [{"t": "Weekly Recap: Shares down YTD, ~40% net income drop and leadership changes", "s": 0.03}, {"t": "From BJ's to Lululemon, Retailers Are Trimming Assortments to Boost Business", "s": 0.4}, {"t": "LULU Stock Heads For Second Week Of Decline: Lululemon Overhauls Leadership To Reignite Growth", "s": 0.38}, {"t": "Lululemon's New CEO Shakes Up Management — Update", "s": 0.0}]}, {"name": "NDX", "desc": "NASDAQ-100 Index", "symbol": "NASDAQ:NDX", "price": 29950.8159, "chg": -2.02, "rec": -0.1575757575757576, "rsi": 44.6, "tech": -0.12, "sentiment": -0.049, "score": 0.451, "signal": "SELL", "headlines": [{"t": "S&P 500, Nasdaq See Worst Day In Over Two Months As Chipmaker Rout Deepens, CPI Data Comes In Hot — AAPL, SPCX, DRAM, SOXX In Focus", "s": -0.62}, {"t": "Nasdaq indices fall 2% as AI stocks lead Wall Street meltdown - Key factors explained", "s": 0.0}, {"t": "Nasdaq tumbles 2%, and these 10 stocks have fueled the selloff", "s": 0.0}, {"t": "Nasdaq 100 Drops 1% on Hot CPI, SOXX Falls 7th Day: Stock Market Today", "s": 0.0}]}, {"name": "2330", "desc": "Taiwan Semiconductor Manufacturing Co., Ltd.", "symbol": "TWSE:2330", "price": 2435, "chg": -2.21, "rec": -0.2909090909090909, "rsi": 43.4, "tech": -0.269, "sentiment": 0.278, "score": 0.448, "signal": "SELL", "headlines": [{"t": "TSMC expected to report sixth straight quarter of record profit thanks to AI boom", "s": 0.77}, {"t": "TSMC Shares Decline 2.0%; MediaTek Shares Fall 4.7%", "s": 0.53}, {"t": "Taiwan's Taiex Falls 2.8% in Early Session", "s": 0.0}, {"t": "Key facts: TSMC (2330) Q3 revenue NT$1.49T record; 2026 capex $60–64B", "s": 0.0}]}, {"name": "TSLA", "desc": "Tesla, Inc.", "symbol": "NASDAQ:TSLA", "price": 367.16, "chg": -2.15, "rec": -0.4242424242424242, "rsi": 49.3, "tech": -0.199, "sentiment": -0.003, "score": 0.43, "signal": "SELL", "headlines": [{"t": "Tesla-SpaceX Merger Could Be Announced As Early As Before December AGM, Says Barclays", "s": 0.0}, {"t": "Tesla and SpaceX could merge before December 6 -- Barclays", "s": 0.0}, {"t": "Amazon Is the Most Crowded Stock for Hedge Funds. Tesla, Not So Much. — Barrons.com", "s": 0.18}, {"t": "Controversial \"Musk\" documentary hits theaters amid legal threats, X ban", "s": -0.77}]}, {"name": "700", "desc": "Tencent Holdings Ltd", "symbol": "HKEX:700", "price": 420.2, "chg": -0.76, "rec": -0.5575757575757576, "rsi": 43.2, "tech": -0.316, "sentiment": 0.037, "score": 0.395, "signal": "STRONG SELL", "headlines": [{"t": "Michael Burry Buys China Stocks While Shorting Nasdaq: These ETFs Capture His Bet", "s": 0.0}, {"t": "Tencent Bought Back 237,000 Shares For HK$100.2 Million On Oct 14, HKEX Filing Shows", "s": 0.3}, {"t": "Tencent Tests Personal Investment Analysis Assistant Rena Liancai With WeChat Integration", "s": 0.0}, {"t": "WeCom Deepens Integration With WorkBuddy, Enabling Access to Chat and Meeting Records", "s": 0.0}]}, {"name": "HSI", "desc": "Hang Seng Index", "symbol": "TVC:HSI", "price": 24011.85, "chg": -1.24, "rec": -0.4642857142857143, "rsi": 39.4, "tech": -0.296, "sentiment": -0.065, "score": 0.387, "signal": "STRONG SELL", "headlines": [{"t": "Hong Kong Stocks Face Pressure as AI Selloff Deepens", "s": -0.3}, {"t": "China stocks close at one-year low as AI hardware rout deepens", "s": -0.27}, {"t": " Asia report: Markets mixed as investors weigh China data and global rate outlook ", "s": 0.0}, {"t": "ASIA MIDDAY MOVES | KOSPI, TAIEX Rise Over 1% as Chipmakers Rebound; Xiaomi Leads Hong Kong Gains", "s": 0.34}]}],IDEAS=[{"name": "3774", "desc": "Fameglow Holdings Limited", "symbol": "HKEX:3774", "price": 29.92, "chg": 1.77, "rec": 0.6363636363636364, "rsi": 60.9, "tech": 0.674, "sentiment": 0.49, "score": 0.809, "signal": "STRONG BUY", "headlines": [{"t": "Fameglow Unit Enters Technology Development Agreement With Sunseeker On 15 July 2026", "s": 0.49}]}, {"name": "LSRCF", "desc": "Lasertec Corp.", "symbol": "OTC:LSRCF", "price": 294.466, "chg": -3.45, "rec": 0.603030303030303, "rsi": 58.6, "tech": 0.702, "sentiment": 0.318, "score": 0.793, "signal": "STRONG BUY", "headlines": [{"t": "Lasertec Corporation Full Year Profit Falls", "s": 0.44}, {"t": "Lasertec: FY2026 outperformed forecasts; FY2027 targets record sales and profits amid strong semiconductor demand", "s": 0.69}, {"t": "Lasertec: Profits fell on lower sales, but record orders and backlog point to strong growth ahead", "s": 0.85}, {"t": "TABLE-Lasertec -2025/26 group results", "s": 0.0}]}, {"name": "VYLR", "desc": "Vylor Inc.", "symbol": "NYSE:VYLR", "price": 74.41, "chg": -3.29, "rec": 1, "rsi": 50, "tech": 0.7, "sentiment": 0.061, "score": 0.754, "signal": "STRONG BUY", "headlines": [{"t": "Vylor Price Target Announced at $75.00/Share by BNP Paribas", "s": 0.0}, {"t": "Vylor hit with temporary restraining order on asset moves as appeal proceeds", "s": 0.36}, {"t": "UBS starts Vylor at Buy, sees upside on seed licensing growth", "s": 0.38}, {"t": "Vylor Price Target Announced at $89.00/Share by UBS", "s": 0.0}]}, {"name": "PSX", "desc": "Phillips 66", "symbol": "NYSE:PSX", "price": 297.29, "chg": 1.56, "rec": 0.603030303030303, "rsi": 79.0, "tech": 0.641, "sentiment": 0.177, "score": 0.751, "signal": "STRONG BUY", "headlines": [{"t": "Phillips 66 Price Target Raised to $345.00/Share From $335.00 by Wells Fargo", "s": 0.25}, {"t": "What are the Prospects for Phillips 66's Refining Operations?", "s": 0.3}, {"t": "Phillips 66 Is Maintained at Neutral by Citigroup", "s": 0.0}, {"t": "30 U.S. stocks flashing Strong Buy ratings as earnings roll in", "s": 0.51}]}, {"name": "LZAGF", "desc": "Lonza Group AG", "symbol": "OTC:LZAGF", "price": 715.55, "chg": 7.84, "rec": 0.6484848484848484, "rsi": 55.8, "tech": 0.621, "sentiment": 0.215, "score": 0.75, "signal": "STRONG BUY", "headlines": [{"t": "Key facts: Lonza (LONN) reorganized; CHI sale and CHF500m buyback", "s": 0.0}, {"t": "Lonza sets new mid-term targets, confirms 2026 outlook", "s": 0.0}, {"t": "Lonza Sees Maturing Projects Driving Profitability Higher Over Medium Term", "s": 0.27}, {"t": "Lonza Upgrades Organic Growth Model And Mid-Term Financial Ambitions At Capital Markets Day", "s": 0.38}]}, {"name": "551", "desc": "Yue Yuen Industrial (Holdings) Limited", "symbol": "HKEX:551", "price": 14.4, "chg": 1.41, "rec": 0.49090909090909096, "rsi": 72.7, "tech": 0.627, "sentiment": 0.174, "score": 0.746, "signal": "STRONG BUY", "headlines": [{"t": "Yue Yuen Industrial (Holdings) Posts September Net Consolidated Operating Revenue USD 668.60 Million", "s": 0.0}, {"t": "Yue Yuen Industrial (Holdings) Enters CCT Agreements With PCC On Oct 7", "s": 0.27}, {"t": "Yue Yuen Industrial Says August Net Consolidated Operating Revenue USD 636.65 MLN", "s": 0.0}, {"t": "Yue Yuen Industrial: Revenue and profit fell sharply, with margin pressure and cost increases impacting both segments", "s": 0.18}]}],STAMP="2026-10-15 11:32";
+const INIT=/*INIT*/[],IDEAS=/*IDEAS*/[],STAMP=/*STAMP*/'';
 const PROXY='https://corsproxy.io/?url=';   // used only if the browser blocks direct requests; '' disables
 const COLS=["name","description","close","change","Recommend.All","RSI","MACD.macd","MACD.signal","Perf.1M"];
 const MK={HKEX:'hongkong',TWSE:'taiwan',TPEX:'taiwan',TSE:'japan',LSE:'uk',SSE:'china',SZSE:'china',NASDAQ:'america',NYSE:'america',AMEX:'america',NYSEARCA:'america',SP:'america',DJ:'america',CBOE:'america'};
 const $=id=>document.getElementById(id),fmt=p=>p.toLocaleString(undefined,{maximumFractionDigits:2});
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const theme=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
-let ex=[],rm=[],timer=null,busy=false,tapeKey='';
+let ex=[],rm=[],timer=null,busy=false,tapeKey='',BR=null,ACCT={env:'',cash:{},positions:[]},PM={},LOT={},cool={},pend=null,acctTimer=null;const HOLD_MS=60000;
 try{ex=JSON.parse(localStorage.getItem('ex'))||[];rm=JSON.parse(localStorage.getItem('rm'))||[]}catch(e){}
 const save=()=>{try{localStorage.setItem('ex',JSON.stringify(ex));localStorage.setItem('rm',JSON.stringify(rm))}catch(e){}};
 let rows=INIT.filter(r=>!rm.includes(r.symbol));
 
 /* ---- TradingView data (same scoring as the Python script) ---- */
 async function req(u,body){
+  if(BR)try{return await br('/api/proxy',{method:'POST',body:JSON.stringify({url:u,body:body||null})})}catch(e){}
   for(const x of [u,...(PROXY?[PROXY+encodeURIComponent(u)]:[])]){
     try{const r=await fetch(x,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});if(r.ok)return await r.json()}catch(e){}
   }
@@ -117,7 +251,7 @@ function card(r,idea){
   <span><span class="badge bdg ${k}">${r.signal}</span>${idea?`<button class="rm" data-watch="${S}" title="Add to watchlist" style="font-size:13px;border:1px solid var(--mu);border-radius:6px">+ Watch</button>`:`<button class="rm" data-rm="${S}" title="Remove">×</button>`}</span></div>
   <div class="mu">${esc(r.desc||'')}</div><div><span class="px">${fmt(r.price)}</span> <span class="chg ${r.chg>=0?'pos':'neg'}">${r.chg>=0?'+':''}${r.chg.toFixed(2)}%</span></div>
   <div class="bar"><i style="width:${r.score*100}%"></i></div><div class="mu sc">${metrics(r)}</div>
-  <div class="ch" data-tv="${S}"></div><button class="full" data-full="${S}">📈 Full price history chart</button><ul>${h}</ul></div>`;
+  <div class="ch" data-tv="${S}"></div><button class="full" data-full="${S}">📈 Full price history chart</button>${fcode(r.symbol)?`<div class="tbtn"><button data-trade="BUY|${S}">Buy</button><button data-trade="SELL|${S}">Sell</button></div>`:''}<ul>${h}</ul></div>`;
 }
 function sum(){
   $('sum').innerHTML=['STRONG BUY','BUY','HOLD','SELL','STRONG SELL'].map(l=>{const n=rows.filter(r=>r.signal===l).map(r=>esc(r.name)).join(', ');
@@ -141,9 +275,10 @@ function upd(r,old){
 /* ---- actions ---- */
 async function tick(){
   if(busy||!rows.length)return;busy=true;
-  try{const d=await scan(rows.map(r=>r.symbol));
-    for(const r of rows){const x=d[r.symbol];if(!x)continue;const old=r.price;
-      Object.assign(r,{price:x.close,chg:x.change||0,rec:x['Recommend.All']||0,rsi:x.RSI||50},calc(x,r.sentiment));upd(r,old)}
+  try{const syms=rows.map(r=>r.symbol);
+    const [d,q]=await Promise.all([scan(syms),BR?br('/api/quotes?symbols='+encodeURIComponent(syms.join(','))).catch(()=>({})):{}]);
+    for(const r of rows){const x=d[r.symbol];if(!x)continue;const old=r.price,f=q[r.symbol];if(f)LOT[r.symbol]=f.lot;
+      Object.assign(r,{price:f?f.p:x.close,chg:f?f.chg:(x.change||0),rec:x['Recommend.All']||0,rsi:x.RSI||50},calc(x,r.sentiment));upd(r,old);autoCheck(r)}
     sum();$('st').textContent='Last tick '+new Date().toLocaleTimeString()}
   catch(e){$('st').textContent='Live update failed (offline or blocked)'}
   busy=false;
@@ -170,11 +305,301 @@ async function add(){
 $('add').onclick=add;$('q').onkeydown=e=>{if(e.key==='Enter')add()};$('re').onclick=analyzeAll;
 document.body.onclick=e=>{const t=e.target,d=t.dataset;
   if(d.full)openChart(d.full);
+  else if(d.trade){const[sd,s]=d.trade.split('|');openOrder(sd,rows.find(r=>r.symbol===s)||IDEAS.find(r=>r.symbol===s)||posRow(s))}
   else if(d.rm){rows=rows.filter(r=>r.symbol!==d.rm);ex=ex.filter(x=>x!==d.rm);if(INIT.some(r=>r.symbol===d.rm)&&!rm.includes(d.rm))rm.push(d.rm);save();render()}
   else if(d.watch){const r=IDEAS.find(x=>x.symbol===d.watch);if(r)addRow({...r})}};
+/* ---- Futu bridge: account, orders, confirm-before-trade ---- */
+const fcode=t=>{const[e,s]=t.split(':');if(!s)return/^(HK|US)\./.test(t)?t:null;if(e==='HKEX'&&/^\d+$/.test(s))return'HK.'+s.padStart(5,'0');return['NASDAQ','NYSE','AMEX','NYSEARCA'].includes(e)?'US.'+s:null};
+async function br(p,o={}){const r=await fetch(BR.url+p,{...o,headers:{'X-Token':BR.token,'Content-Type':'application/json'}});const j=await r.json().catch(()=>({}));if(!r.ok)throw j.error||('HTTP '+r.status);return j}
+async function connect(t,port){
+  BR={url:`http://127.0.0.1:${port||8765}`,token:t};
+  try{const s=await br('/api/status');document.body.classList.add('br');$('autobar').hidden=false;
+    $('bs').textContent='Connected · '+s.env+(s.env==='REAL'?' (REAL MONEY)':' (paper trading)');
+    await loadAcct();clearInterval(acctTimer);acctTimer=setInterval(loadAcct,15000);tick()}
+  catch(e){BR=null;$('bs').textContent='⚠ Could not connect to the bridge: '+e}
+}
+async function loadAcct(){
+  try{ACCT=await br('/api/account');PM={};ACCT.positions.forEach(x=>PM[x.code]=x);
+    const cash=Object.entries(ACCT.cash).map(([m,c])=>`${m}: cash ${fmt(c.cash)} · total assets ${fmt(c.total)}`).join(' | ');
+    const tr=ACCT.positions.map(p=>`<tr><td>${esc(p.name)} <span class="mu">${esc(p.code)}</span></td><td>${fmt(p.qty)}</td><td>${fmt(p.cost)}</td><td>${fmt(p.price)}</td><td class="${p.pl>=0?'pos':'neg'}">${p.pl>=0?'+':''}${p.pl.toFixed(1)}%</td><td><button data-trade="SELL|${esc(p.code)}">Sell</button></td></tr>`).join('');
+    $('acct').innerHTML=`<span class="badge ${ACCT.env==='REAL'?'STRONGSELL':'HOLD'}">${ACCT.env}</span> ${cash||'No account data'}`+(tr?`<table><tr><th>Holding</th><th>Qty</th><th>Cost</th><th>Price</th><th>P/L</th><th></th></tr>${tr}</table>`:'<div>No open positions</div>')}
+  catch(e){$('bs').textContent='⚠ '+e}
+}
+const posRow=c=>{const p=PM[c];return p?{symbol:c,name:p.name,price:p.price}:null};
+function openOrder(side,r,note){
+  if(!r||!BR)return;const fc=fcode(r.symbol),lot=LOT[r.symbol]||LOT[fc]||1,px=r.price;pend={side,sym:r.symbol};
+  $('ot').textContent=`${side==='BUY'?'Buy':'Sell'} ${r.name} (${r.symbol})`;
+  $('oi').textContent=(note?note+' · ':'')+`Account: ${ACCT.env}${ACCT.env==='REAL'?' — REAL MONEY':' (paper trading)'}`;
+  $('oq').value=side==='BUY'?Math.max(lot,Math.floor((+$('bud').value||0)/px/lot)*lot):(PM[fc]?PM[fc].can_sell:lot);
+  $('op').value=px;$('oe').textContent='';$('om').hidden=false;
+}
+$('oy').onclick=async()=>{
+  $('oy').disabled=true;$('oe').textContent='';
+  try{const j=await br('/api/order',{method:'POST',body:JSON.stringify({symbol:pend.sym,side:pend.side,qty:+$('oq').value,price:+$('op').value})});
+    $('om').hidden=true;$('st').textContent=`Order sent (${j.env}): ${pend.side} ${pend.sym} · id ${j.order_id}`;loadAcct()}
+  catch(e){$('oe').textContent='⚠ '+e}
+  $('oy').disabled=false;
+};
+$('on').onclick=()=>{$('om').hidden=true};
+$('cn').onclick=()=>{if($('tk').value.trim())connect($('tk').value.trim())};
+function autoCheck(r){   // asks for confirmation only; never trades by itself
+  if(r.signal!==r._sig){r._sig=r.signal;r._since=Date.now();r._fired=false}
+  const fc=fcode(r.symbol);
+  if(!BR||!fc||!$('auto').checked||r._fired||Date.now()-r._since<HOLD_MS||!$('om').hidden||(cool[r.symbol]||0)>Date.now())return;
+  const held=PM[fc]&&PM[fc].can_sell>0;
+  if(r.signal==='STRONG BUY'&&!held)openOrder('BUY',r,`Signal: STRONG BUY (score ${r.score.toFixed(2)}) held for 1+ min`);
+  else if(r.signal==='STRONG SELL'&&held)openOrder('SELL',r,`Signal: STRONG SELL (score ${r.score.toFixed(2)}) held for 1+ min`);
+  else return;
+  r._fired=true;cool[r.symbol]=Date.now()+3600e3;
+}
 (async()=>{
+  const h=new URLSearchParams(location.hash.slice(1));if(h.get('t')){connect(h.get('t'),h.get('p'));history.replaceState(null,'',location.pathname)}
   render();$('upd').textContent='Ratings from Python run: '+STAMP;
   const m=ex.filter(s=>!rows.some(r=>r.symbol===s));
   if(m.length)try{const d=await scan(m);for(const s of m)if(d[s])rows.push(mkRow(s,d[s],await news(s)));sortRender()}catch(e){}
 })();
-</script>
+</script>"""
+
+
+class Err(Exception):
+    pass
+
+
+def futu_code(t):
+    if t.startswith(("HK.", "US.")):
+        return t
+    ex, _, s = t.partition(":")
+    if ex == "HKEX" and s.isdigit():
+        return f"HK.{int(s):05d}"
+    if ex in ("NASDAQ", "NYSE", "AMEX", "NYSEARCA") and s:
+        return "US." + s
+    return None
+
+
+def lot_size(code):
+    if code not in LOT:
+        ret, s = quote.get_market_snapshot([code])
+        if ret != ft.RET_OK or not len(s):
+            raise Err(f"Futu does not know {code}.")
+        LOT[code] = int(s.iloc[0]["lot_size"] or 1)
+    return LOT[code]
+
+
+def quotes(symbols):
+    codes = {futu_code(t): t for t in symbols if futu_code(t)}
+    out = {}
+    if not codes:
+        return out
+    with LOCK:
+        new = [c for c in codes if c not in SUBBED]
+        if new:
+            ret, _ = quote.subscribe(new, [ft.SubType.QUOTE])
+            if ret == ft.RET_OK:
+                SUBBED.update(new)
+        ret, df = quote.get_stock_quote(list(codes))
+        if ret == ft.RET_OK:
+            for _, r in df.iterrows():
+                p, pc = float(r["last_price"]), float(r["prev_close_price"] or 0)
+                c = r["code"]
+                try:
+                    lot = lot_size(c)
+                except Err:
+                    lot = 1
+                out[codes[c]] = {"p": p, "chg": (p / pc - 1) * 100 if pc else 0, "lot": lot}
+    return out
+
+
+def account():
+    res = {"env": ENV_NAME, "cash": {}, "positions": []}
+    with LOCK:
+        for m, c in tctx.items():
+            ret, a = c.accinfo_query(trd_env=ENV)
+            if ret == ft.RET_OK and len(a):
+                r = a.iloc[0]
+                res["cash"][m] = {"cash": float(r["cash"]), "total": float(r["total_assets"]), "mv": float(r["market_val"])}
+            ret, p = c.position_list_query(trd_env=ENV)
+            if ret == ft.RET_OK:
+                for _, r in p.iterrows():
+                    if float(r["qty"]) > 0:
+                        cost, px = float(r["cost_price"]), float(r["nominal_price"])
+                        res["positions"].append({"code": r["code"], "name": r["stock_name"], "qty": float(r["qty"]),
+                                                 "can_sell": float(r["can_sell_qty"]), "cost": cost, "price": px,
+                                                 "pl": (px / cost - 1) * 100 if cost else 0.0})
+    return res
+
+
+def order(b):
+    code = futu_code(str(b.get("symbol", "")))
+    side = b.get("side")
+    if not code:
+        raise Err("This symbol can't be traded through Futu (only HK and US stocks).")
+    if side not in ("BUY", "SELL"):
+        raise Err("Side must be BUY or SELL.")
+    qty, price = int(b.get("qty", 0)), float(b.get("price", 0))
+    if qty <= 0 or price <= 0:
+        raise Err("Enter a positive quantity and price.")
+    with LOCK:
+        lot = lot_size(code)
+    if qty % lot:
+        raise Err(f"Quantity must be a multiple of the lot size ({lot}).")
+    if qty * price > A.max_order:
+        raise Err(f"Order value {qty * price:,.0f} is above your --max-order limit ({A.max_order:,.0f}).")
+    ctx = tctx.get("HK" if code.startswith("HK.") else "US")
+    if not ctx:
+        raise Err("No trading connection for that market.")
+    with LOCK:
+        ret, df = ctx.place_order(price=price, qty=qty, code=code, order_type=ft.OrderType.NORMAL, trd_env=ENV,
+                                  trd_side=ft.TrdSide.BUY if side == "BUY" else ft.TrdSide.SELL)
+    if ret != ft.RET_OK:
+        raise Err(str(df))
+    with open("orders.log", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": time.strftime("%F %T"), "env": ENV_NAME, "code": code, "side": side, "qty": qty, "price": price}) + "\n")
+    return {"order_id": str(df.iloc[0]["order_id"]), "env": ENV_NAME}
+
+
+def proxy(b):
+    url = b.get("url", "")
+    if not url.startswith(TV_HOSTS):
+        raise Err("Only TradingView hosts are allowed.")
+    r = S.post(url, json=b["body"], timeout=20) if b.get("body") else S.get(url, timeout=20)
+    return r.json()
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def cors(self):
+        for k, v in (("Allow-Origin", "*"), ("Allow-Headers", "X-Token, Content-Type"),
+                     ("Allow-Methods", "GET, POST, OPTIONS"), ("Allow-Private-Network", "true")):
+            self.send_header("Access-Control-" + k, v)
+
+    def out(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.cors()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.cors()
+        self.end_headers()
+
+    def handle_api(self, body):
+        if not secrets.compare_digest(self.headers.get("X-Token", ""), TOKEN):
+            return self.out(401, {"error": "bad token"})
+        u = up.urlparse(self.path)
+        q = up.parse_qs(u.query)
+        try:
+            if u.path == "/api/status":
+                return self.out(200, {"env": ENV_NAME, "markets": list(tctx)})
+            if u.path == "/api/quotes":
+                return self.out(200, quotes([s for s in q.get("symbols", [""])[0].split(",") if s]))
+            if u.path == "/api/account":
+                return self.out(200, account())
+            if u.path == "/api/order":
+                return self.out(200, order(body or {}))
+            if u.path == "/api/proxy":
+                return self.out(200, proxy(body or {}))
+            self.out(404, {"error": "not found"})
+        except Err as e:
+            self.out(400, {"error": str(e)})
+        except Exception as e:
+            self.out(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def do_GET(self):
+        self.handle_api(None)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        self.handle_api(json.loads(self.rfile.read(n) or b"{}"))
+
+
+
+def build_report():
+    syms = load(A.watchlist)
+    data = scan(syms)
+    rows = []
+    for t in syms:
+        if t in data:
+            rows.append(row(t, data[t], news(t)))
+            print("ok  ", t)
+        else:
+            print("not found on TradingView:", t)
+    rows.sort(key=lambda r: -r["score"])
+    ideas = discover(set(syms))
+    safe = lambda o: json.dumps(o, ensure_ascii=False).replace("</", "<\\/")
+    page = (TEMPLATE.replace("/*INIT*/[]", safe(rows)).replace("/*IDEAS*/[]", safe(ideas))
+            .replace("/*STAMP*/''", safe(dt.datetime.now().strftime("%Y-%m-%d %H:%M"))))
+    PAGE.parent.mkdir(exist_ok=True)
+    PAGE.write_text(page, encoding="utf-8")
+    print("Wrote", PAGE.resolve())
+
+
+def start_bridge():
+    """Connect to Futu OpenD and start the local bridge the page talks to."""
+    global ft, quote, TOKEN, ENV, ENV_NAME
+    try:
+        import futu as ft
+    except ImportError:
+        raise SystemExit("Trading needs the Futu library:  pip install futu-api")
+    ENV, ENV_NAME = (ft.TrdEnv.REAL, "REAL") if A.real else (ft.TrdEnv.SIMULATE, "SIMULATE")
+    quote = ft.OpenQuoteContext(host=A.opend_host, port=A.opend_port)
+    for m, tm in (("HK", ft.TrdMarket.HK), ("US", ft.TrdMarket.US)):
+        try:
+            tctx[m] = ft.OpenSecTradeContext(filter_trdmarket=tm, host=A.opend_host, port=A.opend_port,
+                                             security_firm=getattr(ft.SecurityFirm, A.firm))
+        except Exception as e:
+            print(f"{m} trading unavailable:", e)
+    if A.real:
+        pwd = os.environ.get("FUTU_TRADE_PWD")
+        if not pwd:
+            raise SystemExit("--real needs the FUTU_TRADE_PWD environment variable.")
+        for c in tctx.values():
+            ret, msg = c.unlock_trade(pwd)
+            if ret != ft.RET_OK:
+                raise SystemExit(f"Unlock failed: {msg}")
+    TOKEN = secrets.token_urlsafe(18)
+    srv = ThreadingHTTPServer(("127.0.0.1", A.port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return PAGE.resolve().as_uri() + f"#t={TOKEN}&p={A.port}"
+
+
+def main():
+    global A
+    ap = argparse.ArgumentParser(description="TradingView analysis + Futu trading dashboard")
+    ap.add_argument("--watchlist", default="watchlist.txt")
+    ap.add_argument("--open", action="store_true", help="open the page in your browser")
+    ap.add_argument("--skip-analysis", action="store_true", help="reuse the existing docs/index.html")
+    ap.add_argument("--trade", action="store_true", help="connect to Futu OpenD so the page can show holdings and trade")
+    ap.add_argument("--real", action="store_true", help="use REAL money (default is simulated paper trading)")
+    ap.add_argument("--firm", default="FUTUSECURITIES")
+    ap.add_argument("--max-order", dest="max_order", type=float, default=20000, help="reject any single order above this value")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--opend-host", default="127.0.0.1")
+    ap.add_argument("--opend-port", type=int, default=11111)
+    A = ap.parse_args()
+    if not A.skip_analysis:
+        build_report()
+    elif not PAGE.exists():
+        raise SystemExit("No docs/index.html yet - run once without --skip-analysis.")
+    link = PAGE.resolve().as_uri()
+    if A.trade:
+        link = start_bridge()
+        print(f"\n*** Futu bridge on 127.0.0.1:{A.port} - {ENV_NAME} {'(REAL MONEY!)' if A.real else '(paper trading)'} ***")
+        print("Open this link (it contains your one-time token):\n" + link + "\n")
+    if A.open:
+        webbrowser.open(link)
+    if A.trade:
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
